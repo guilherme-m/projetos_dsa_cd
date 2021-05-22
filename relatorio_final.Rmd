@@ -1,0 +1,332 @@
+---
+title: "Cliques em Propagandas que são Convertidos em Download"
+author: "Guilherme Maia Batista"
+output: pdf_document
+---
+
+```{r setup, echo = FALSE, message = FALSE}
+
+# Parâmetros iniciais
+
+knitr::opts_chunk$set(echo = TRUE)
+
+
+# Definição da pasta que será utilizada durante o projeto
+pasta = paste0('D:/Coisas/Data Science Academy/',
+               '1 - Formacao Cientista de Dados/',
+               '01 - Big Data em R e Azure/Projetos/Projeto 1')
+
+setwd(pasta)
+
+# Pacotes que serão utilizados durante o projeto
+library(RSQLite)
+library(tidyverse)
+library(lubridate)
+library(knitr)
+library(randomForest)
+library(e1071)
+library(C50)
+library(kernlab)
+library(xgboost)
+
+```
+
+## 1 Entendendo o Problema de Negócio
+
+O sucesso de uma empresa está associado não apenas à qualidade do seu produto/serviço, como também à sua capacidade de alcançar potenciais clientes. Por isso a importância de investimentos na área de publicidade.
+
+Divulgar um produto por meio de anúncios na internet é uma das formas mais efetivas de dar-lhe visibilidade, sendo que os custos desses anúncios estão associados ao número de cliques que recebem. Dessa forma, é essencial identificar quais cliques possuem maior chance de serem convertidos em download do aplicativo.
+
+Para melhorar a capacidade de identificação de cliques convertidos em download, a empresa TalkingData disponibilizou um dataset ^[<https://www.kaggle.com/c/talkingdata-adtracking-fraud-detection/data>] com informações sobre diversos cliques rotulados como 0 (não convertido) ou 1 (convertido). O objetivo deste estudo é, a partir do dataset disponibilizado, construir um modelo que classifique com precisão um clique como convertido ou não em download.
+
+## 2 Entendendo os Dados
+
+```{r entendendo os dados, eval = FALSE, echo = FALSE}
+
+# Esse bloco realiza:
+# 1 - Leitura do arquivo completo
+# 2 - Contagem de quantos cliques existem para cada 
+#     variável target (0 = não convertido; 1 = convertido)
+# 3 - Undersample dos cliques não convertidos
+
+conn = dbConnect(RSQLite::SQLite(), 'train.db')
+
+read_delim_chunked('train.csv', delim = ',',callback =  function(chunk, x) {
+  dbWriteTable(conn, chunk, name="train", append=TRUE ) #write to sqlite 
+}, col_types = cols(
+  ip = col_double(),
+  app = col_double(),
+  device = col_double(),
+  os = col_double(),
+  channel = col_double(),
+  click_time = col_character(),
+  attributed_time = col_character(),
+  is_attributed = col_double()
+))
+
+
+df_is_att_1 = dbGetQuery(conn, 'select * from train where is_attributed = 1')
+df_is_att_0 = dbGetQuery(conn, sprintf('select * from train 
+                        where is_attributed = 0 order by random()
+                        limit %d', nrow(df_is_att_1)))
+
+df = rbind(df_is_att_0, df_is_att_1)
+
+write.table(df, 
+            file = 'datasets_finais/train_undersampling.csv',
+            sep = ',', 
+            row.names = FALSE)
+
+dbGetQuery(conn, 'select is_attributed, count(*) from train group by is_attributed')
+
+dbDisconnect(conn)
+
+```
+
+O dataset é composto de 184.903.890 cliques realizados durante o período de 4 dias. Porém, apenas 456.846  cliques foram convertidos em download, menos de 1%. Esse desbalanceamento de classes pode causar problemas durante o treinamento de um modelo: ele aprenderia muito sobre os cliques não convertidos e quase nada sobre os cliques convertidos.
+
+Para contornar isso, foi utilizada a técnica de undersampling, que consiste em extrair apenas uma amostra da classe majoritária para que o dataset tenha uma proporção balanceada entre as classes. Assim, o dataset considerado para o restante da análise consistiu em 913.693 observações (metade para cada categoria). Na tabela abaixo está a descrição de cada variável.
+
+```{r lendo os dados, echo = FALSE}
+df = read.table('datasets_finais/train_undersampling.csv',
+                sep = ',', 
+                header = TRUE)
+
+variaveis = data.frame(nome_da_variavel = colnames(df),
+                       tipo = c('categórica nominal', 
+                                'categórica nominal',
+                                'categórica nominal',
+                                'categórica nominal',
+                                'categórica nominal',
+                                'data e hora',
+                                'data e hora',
+                                'categórica nominal'
+                                ),
+                       descricao = c('Endereço IP do clique',
+                                     'ID do aplicativo que mostrou o anúncio',
+                                     'Modelo do celular',
+                                     'Sistema operacional do celular',
+                                     'ID do canal do publicador do anúncio',
+                                     'Data e hora em que o clique foi efetuado',
+                                     'Se o usuário efetuou o download, mostra a data e hora do download',
+                                     'Variável target, indica se o clique é convertido ou não'))
+
+kable(variaveis)
+
+df = df %>% 
+  mutate(click_time = ymd_hms(click_time),
+         attributed_time = ymd_hms(attributed_time),
+         click_hour = hour(click_time))
+
+col_quali = c('ip', 'app', 'device', 'os', 'channel', 'is_attributed')
+df[col_quali] = lapply(df[col_quali], as.factor)
+
+
+```
+
+
+``` {r análise gráfica, echo=FALSE, out.height='60%', out.width='80%'}
+df %>% ggplot(aes(x = click_hour, color = is_attributed)) +
+  geom_line(stat = 'count') +
+  labs(x = 'Hora', 
+       y = 'Cliques',
+       title = 'Número de cliques por hora do dia', 
+       color = 'Conversão')+
+   scale_color_brewer(palette = 'Set2')
+````
+
+O comportamento dos cliques durante as horas do dia parecem seguir o mesmo padrão. 
+
+```{r, echo=FALSE, out.height='60%', out.width='80%'}
+df %>% 
+  ggplot(aes(x = os %>% fct_reorder(is_attributed, .fun = function(.x) mean(.x == 1)), 
+               fill = is_attributed))+
+  geom_bar(position = 'fill') +
+  scale_x_discrete(breaks = NULL)+ 
+  labs(x = 'Sistema Operacional', 
+       y = 'Proporção',
+       title = 'Proporção de Conversões por Sistema Operacional',
+       fill = 'Conversão') +
+  scale_y_continuous(labels = scales::percent)+
+  scale_fill_brewer(palette = 'Set2')
+```
+
+Nesse gráfico cada coluna representa um sistema operacional diferente. Nele é possível observar que há uma quantidade maior de sistemas operacionais sem nenhum clique convertido em download do que sistemas operacionais com apenas cliques convertidos.
+
+```{r, echo=FALSE, out.height='60%', out.width='80%'}
+
+df %>% 
+  ggplot(aes(x = channel %>% fct_reorder(is_attributed, .fun = function(.x) mean(.x == 1)), 
+               fill = is_attributed))+
+  geom_bar(position = 'fill') +
+  scale_x_discrete(breaks = NULL)+ 
+  labs(x = 'Canal', 
+       y = 'Proporção',
+       title = 'Proporção de Conversões por Canal',
+       fill = 'Conversão') +
+  scale_y_continuous(labels = scales::percent)+
+  scale_fill_brewer(palette = 'Set2')
+```
+
+A maioria dos canais tem na sua composição menos de 50% de cliques convertidos. Mas alguns canais possuem praticamente apenas cliques convertidos.
+
+
+```{r, echo=FALSE, out.height='60%', out.width='80%'}
+df %>% 
+  ggplot(aes(x = app %>% fct_reorder(is_attributed, .fun = function(.x) mean(.x == 1)), 
+               fill = is_attributed))+
+  geom_bar(position = 'fill') +
+  scale_x_discrete(breaks = NULL)+ 
+  labs(x = 'Aplicativo', 
+       y = 'Proporção',
+       title = 'Proporção de Conversões por Aplicativo',
+       fill = 'Conversão') +
+  scale_y_continuous(labels = scales::percent)+
+  scale_fill_brewer(palette = 'Set2')
+```
+
+Para os aplicativos para que há uma variação polarizada: ou o aplicativo possui aproximadamente 100% de cliques não convertidos ou ele possui aproximadamente 100% de cliques convertidos.
+
+
+```{r, echo=FALSE, out.height='60%', out.width='80%'}
+
+df %>% 
+  ggplot(aes(x = device %>% fct_reorder(is_attributed, .fun = function(.x) mean(.x == 1)), 
+               fill = is_attributed))+
+  geom_bar(position = 'fill') +
+  scale_x_discrete(breaks = NULL)+ 
+  labs(x = 'Dispositivo', 
+       y = 'Proporção',
+       title = 'Proporção de Conversões por Dispositivo',
+       fill = 'Conversão') +
+  scale_y_continuous(labels = scales::percent)+
+  scale_fill_brewer(palette = 'Set2')
+
+
+
+```
+
+Esse gráfico chama bastante atenção, pois, dentre os 1883 tipos diferentes de dispositivos, quase todos apresentam apenas cliques convertidos em download.
+
+
+
+
+
+## Construção do Modelo
+
+Antes de construir o modelo, a base foi separada em duas de forma aleatória. 90% da base foi utilizada para treinar o modelo e 10% para avaliar a qualidade do modelo (geralmente divide-se a base em 60% para treino e 40% para teste, mas como 10% já representaria 90 mil observações, considerou-se essa divisão). As variáveis click_time e attributed time foram desconsideradas, mas a partir da variável click_time criou-se a variável click_hour (hora que o clique foi feito), que foi testada nos modelos propostos. 
+
+O algoritmo escolhido foi o classificador Naive Bayes. Algumas combinações de variáveis foram testadas, além dos parâmetros do modelo. A melhor combinação utilizou todas as variáveis, exceto a clicK_hour. Abaixo está a matrix de confusão.
+
+```{r, echo = FALSE, message = FALSE}
+
+# Aqui estão os testes de modelos, o que apresentou o melhor resultado foi o mod_3
+set.seed(101)
+ids_train = sample(1:nrow(df), .90*nrow(df))
+
+df_modelo = df %>% select(-attributed_time,-click_time)
+
+df_train = df_modelo[ids_train,]
+df_teste = df_modelo[-ids_train,]
+
+rm(df_modelo, df)
+
+
+mod_1 = naiveBayes(is_attributed~., data = df_train)
+mod_2 = naiveBayes(is_attributed~., data = df_train, laplace = 1)
+mod_3 = naiveBayes(is_attributed~., data = df_train, laplace = 2) #melhor laplace
+mod_4 = naiveBayes(is_attributed~., data = df_train, laplace = 3)
+mod_5 = naiveBayes(is_attributed~. -click_hour, data = df_train, laplace = 2) #melhor laplace + melhor variavel
+mod_6 = naiveBayes(is_attributed~. -click_hour -app, data = df_train, laplace = 2) 
+
+
+
+
+
+
+modResult = function(mod){
+  preds = predict(mod, newdata = df_teste)
+  
+  res = table(Observado = df_teste$is_attributed,Previsto = preds)
+  list(conf_matrix = res, 
+       precision = (res[1,1]+res[2,2])/sum(res))
+}
+
+res = modResult(mod_2)
+
+#lapply(list(mod_1,
+#            mod_2,
+#            mod_3,
+#            mod_4,
+#            mod_5,
+#            mod_6),
+#       FUN = function(x) modResult(x)[[2]])
+#
+
+```
+
+
+```{r, message = FALSE}
+
+mod_final = naiveBayes(is_attributed~.-click_hour, data = df_train, laplace = 2)
+
+res = modResult(mod_final)
+
+kable(res[[1]])
+
+
+
+```
+A precisão do modelo final foi de 90,82% de acerto.
+
+```{r, echo = FALSE,message = FALSE, eval = FALSE}
+
+# Tentativa de refazer o modelo com variáveis criadas, 
+# de forma que o G1 seria o grupo com mais de 80% de cliques convertidos
+
+# Não deu muito certo, o Naive Bayes foi de 90% para 50% de precisão
+
+os_group = df_train %>% 
+  group_by(os) %>% 
+  summarise(prop_1 = sum(is_attributed == 1)/n(),
+            n = n()) %>% 
+  mutate(grupo_os =ifelse(n > 100 & prop_1 > 0.8, 'G1', 'G2'))
+
+app_group = df_train %>% 
+  group_by(app) %>% 
+  summarise(prop_1 = sum(is_attributed == 1)/n(),
+            n = n()) %>% 
+  mutate(grupo_app = ifelse(n > 100 & prop_1 > 0.8, 'G1', 'G2'))
+
+device_group = df_train %>% 
+  group_by(device) %>% 
+  summarise(prop_1 = sum(is_attributed == 1)/n(),
+            n = n()) %>% 
+  mutate(grupo_device = ifelse(n > 100 & prop_1 > 0.8, 'G1', 'G2'))
+
+
+channel_group = df_train %>% 
+  group_by(channel) %>% 
+  summarise(prop_1 = sum(is_attributed == 1)/n(),
+            n = n()) %>% 
+  mutate(grupo_channel = ifelse(n > 100 & prop_1 > 0.8, 'G1', 'G2'))
+
+
+
+df_train2 = df_train %>% 
+  inner_join(os_group %>% select(-prop_1, -n), by = ('os'='os')) %>% 
+  inner_join(channel_group %>% select(-prop_1, -n), by = ('channel'='channel')) %>% 
+  inner_join(app_group %>% select(-prop_1, -n), by = ('app'='app')) %>% 
+  inner_join(device_group %>% select(-prop_1, -n), by = ('device'='device'))
+
+
+
+df_train2[grep('grupo', colnames(df_train2))] = lapply(df_train2[grep('grupo', colnames(df_train2))],
+                                                       as.factor)
+
+mod_7 =naiveBayes(is_attributed ~ grupo_os+grupo_app+grupo_device+grupo_channel+click_hour,
+                  data = df_train2)
+
+modResult(mod_7)
+
+```
